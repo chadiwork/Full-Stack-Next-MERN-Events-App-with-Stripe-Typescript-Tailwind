@@ -1,81 +1,75 @@
-'use server'
+import { headers } from 'next/headers'
+import { NextResponse } from 'next/server'
+import { Webhook } from 'svix'
+import type { WebhookEvent } from '@clerk/nextjs/server'
 
-import { revalidatePath } from 'next/cache'
+import { createUser, updateUser, deleteUser } from '@/lib/actions/user.actions'
 
-import { connectToDatabase } from '@/lib/database'
-import User from '@/lib/database/model/user.model'
-import Event from '@/lib/database/model/event.model'
-import { handleError } from '@/lib/utils'
+export async function POST(req: Request) {
+  const payload = await req.text()
+  const headerPayload = await headers()
+  const svixId = headerPayload.get('svix-id')
+  const svixTimestamp = headerPayload.get('svix-timestamp')
+  const svixSignature = headerPayload.get('svix-signature')
 
-import { CreateUserParams, UpdateUserParams } from '@/types'
-import Order from '@/lib/database/model/order.model'
-
-export async function createUser(user: CreateUserParams) {
-  try {
-    await connectToDatabase()
-
-    const newUser = await User.create(user)
-    return JSON.parse(JSON.stringify(newUser))
-  } catch (error) {
-    handleError(error)
+  if (!svixId || !svixTimestamp || !svixSignature) {
+    return new NextResponse('Missing Svix headers', { status: 400 })
   }
-}
 
-export async function getUserById(userId: string) {
-  try {
-    await connectToDatabase()
+  const webhookSecret = process.env.CLERK_WEBHOOK_SECRET
 
-    const user = await User.findById(userId)
-
-    if (!user) throw new Error('User not found')
-    return JSON.parse(JSON.stringify(user))
-  } catch (error) {
-    handleError(error)
+  if (!webhookSecret) {
+    return new NextResponse('Webhook secret is not configured', { status: 500 })
   }
-}
 
-export async function updateUser(clerkId: string, user: UpdateUserParams) {
+  const wh = new Webhook(webhookSecret)
+
+  let evt: WebhookEvent
+
   try {
-    await connectToDatabase()
-
-    const updatedUser = await User.findOneAndUpdate({ clerkId }, user, { new: true })
-
-    if (!updatedUser) throw new Error('User update failed')
-    return JSON.parse(JSON.stringify(updatedUser))
+    evt = wh.verify(payload, {
+      'svix-id': svixId,
+      'svix-timestamp': svixTimestamp,
+      'svix-signature': svixSignature,
+    }) as WebhookEvent
   } catch (error) {
-    handleError(error)
+    console.error('Webhook verification failed', error)
+    return new NextResponse('Error verifying webhook', { status: 400 })
   }
-}
 
-export async function deleteUser(clerkId: string) {
-  try {
-    await connectToDatabase()
+  const eventType = evt.type
 
-    // Find user to delete
-    const userToDelete = await User.findOne({ clerkId })
+  if (eventType === 'user.created') {
+    const { id, email_addresses, first_name, last_name, username, image_url } = evt.data
 
-    if (!userToDelete) {
-      throw new Error('User not found')
+    await createUser({
+      clerkId: id,
+      email: email_addresses[0]?.email_address || '',
+      firstName: first_name || '',
+      lastName: last_name || '',
+      username: username || '',
+      photo: image_url || '',
+    })
+  }
+
+  if (eventType === 'user.updated') {
+    const { id, email_addresses, first_name, last_name, username, image_url } = evt.data
+
+    await updateUser(id, {
+      firstName: first_name || '',
+      lastName: last_name || '',
+      username: username || '',
+      photo: image_url || '',
+    })
+  }
+
+  if (eventType === 'user.deleted') {
+    const clerkId = evt.data.id
+
+    if (clerkId) {
+      await deleteUser(clerkId)
     }
-
-    // Unlink relationships
-    await Promise.all([
-      // Update the 'events' collection to remove references to the user
-      Event.updateMany(
-        { _id: { $in: userToDelete.events } },
-        { $pull: { organizer: userToDelete._id } }
-      ),
-
-      // Update the 'orders' collection to remove references to the user
-      Order.updateMany({ _id: { $in: userToDelete.orders } }, { $unset: { buyer: 1 } }),
-    ])
-
-    // Delete user
-    const deletedUser = await User.findByIdAndDelete(userToDelete._id)
-    revalidatePath('/')
-
-    return deletedUser ? JSON.parse(JSON.stringify(deletedUser)) : null
-  } catch (error) {
-    handleError(error)
   }
+
+  return NextResponse.json({ success: true, type: eventType })
 }
